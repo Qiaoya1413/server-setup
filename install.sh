@@ -15,6 +15,9 @@ parse_selection() {
     for item in "${selected[@]}"; do
         [[ $item =~ ^[1-5]$ ]] || return 1
     done
+    if [[ " ${selected[*]} " == *' 2 '* && " ${selected[*]} " != *' 4 '* ]]; then
+        selected+=(4)
+    fi
 }
 
 install_packages() {
@@ -71,11 +74,12 @@ install_fonts() {
 }
 
 prepare_config() {
-    python3 - "$1" <<'PY'
+    python3 - "$1" "$2" <<'PY'
 import getpass
 import json
 import os
 from pathlib import Path
+import posixpath
 import secrets
 import sys
 
@@ -85,6 +89,29 @@ if target.exists():
     print("保留已有 config.json；部署脚本会校验配置。")
     raise SystemExit(0)
 config = json.loads((project / "config.example.json").read_text(encoding="utf-8"))
+# 按 Aria2 配置格式逐行读取，不把配置当作 Shell 执行。
+options = {}
+for line in Path(sys.argv[2]).read_text(encoding="utf-8-sig").splitlines():
+    line = line.strip()
+    if line and not line.startswith("#") and "=" in line:
+        key, value = line.split("=", 1)
+        options[key.strip()] = value.strip()
+download_dir = posixpath.normpath(options.get("dir", ""))
+if not download_dir.startswith("/") or download_dir in ("/", "/root", "/etc", "/usr", "/var", "/bin", "/sbin", "/lib") or download_dir == "/app" or download_dir.startswith("/app/"):
+    raise SystemExit("Aria2 dir 必须为独立的绝对下载目录，不能挂载系统或应用目录。")
+secret = options.get("rpc-secret", "")
+if not secret:
+    raise SystemExit("Aria2 缺少 rpc-secret，请先设置 RPC 密钥。")
+port = options.get("rpc-listen-port", "6800")
+if not port.isascii() or not port.isdigit() or not 1 <= int(port) <= 65535:
+    raise SystemExit("Aria2 RPC 端口无效。")
+if options.get("enable-rpc", "false") != "true" or options.get("rpc-listen-all", "false") != "true":
+    raise SystemExit("请先在 Aria2 中启用 enable-rpc=true 和 rpc-listen-all=true，并重启服务，以供容器访问。")
+if options.get("rpc-secure", "false") != "false":
+    raise SystemExit("当前自动配置仅支持本机 HTTP RPC；HTTPS RPC 请手动配置。")
+config.update(host_download_dir=download_dir, aria2_secret=secret,
+              aria2_rpc_url=f"http://host.docker.internal:{int(port)}/jsonrpc")
+print("已读取 Aria2 下载目录与 RPC 配置（密钥不显示）。")
 with open("/dev/tty", "r+") as tty:
     sys.stdin = tty
     for key, label, default, hidden in (
@@ -92,8 +119,6 @@ with open("/dev/tty", "r+") as tty:
         ("openlist_url", "OpenList 地址（容器访问宿主机）", "http://host.docker.internal:5244", False),
         ("openlist_username", "OpenList 用户名", "admin", False),
         ("openlist_password", "OpenList 密码", "", True),
-        ("aria2_rpc_url", "Aria2 RPC 地址", "http://host.docker.internal:6800/jsonrpc", False),
-        ("aria2_secret", "Aria2 RPC 密钥", "", True),
     ):
         while True:
             prompt = label + (f" [{default}]" if default else "") + ": "
@@ -113,7 +138,12 @@ PY
 }
 
 install_private_app() (
-    local repo project answer manifest override
+    local repo project answer manifest override aria_config download_dir
+    aria_config=/root/.aria2c/aria2.conf
+    if [[ ! -s $aria_config ]]; then
+        read -r -p '未找到默认 Aria2 配置，请输入实际 aria2.conf 的绝对路径：' aria_config
+    fi
+    [[ $aria_config == /* && -s $aria_config ]] || fail '缺少 Aria2 配置，请先完成 Aria2 安装'
     install_docker
     install_packages git python3
     read -r -p '私有仓库地址（https://github.com/用户名/仓库.git，不要包含 Token）：' repo
@@ -134,7 +164,7 @@ install_private_app() (
     echo '继续会执行该私库的 deploy.sh；请仅使用你信任的仓库。'
     read -r -p '继续部署？[y/N] ' answer
     [[ $answer == y || $answer == Y ]] || { echo '已取消部署。'; return 0; }
-    prepare_config "$project"
+    prepare_config "$project" "$aria_config"
     install_fonts "$project/fonts"
     manifest="$(mktemp)"
     trap 'rm -f -- "$manifest"' EXIT
@@ -152,15 +182,34 @@ services = config["services"]
 if len(services) != 1:
     raise SystemExit("此安装项仅支持单服务 Compose 项目。")
 name, service = next(iter(services.items()))
+target = Path(sys.argv[2])
+app_config = json.loads((target.parent / "config.json").read_text(encoding="utf-8"))
+download_dir = app_config["host_download_dir"]
+local_service = {}
+volumes = service.get("volumes", [])
+download_targets = {"/downloads", "/hash/download"}
+local_service["volumes"] = [
+    {"type": "bind", "source": download_dir, "target": volume["target"], "read_only": False}
+    for volume in volumes if volume.get("type") == "bind" and volume["target"] in download_targets
+]
+# 保留容器内原有目录，同时提供同路径挂载，供 Aria2 返回的绝对文件路径使用。
+if download_dir not in download_targets:
+    for volume in volumes:
+        mounted = volume["target"].rstrip("/")
+        if download_dir == mounted or download_dir.startswith(mounted + "/") or mounted.startswith(download_dir.rstrip("/") + "/"):
+            raise SystemExit("下载目录与现有容器挂载冲突，拒绝自动部署。")
+    local_service["volumes"].append({"type": "bind", "source": download_dir, "target": download_dir, "read_only": False})
 if not service.get("ports"):
     exposed = service.get("expose", [])
     if len(exposed) != 1 or not str(exposed[0]).isdigit():
         raise SystemExit("需要在 Compose 中声明唯一 expose 端口，或自行配置 ports。")
     port = int(exposed[0])
-    target = Path(sys.argv[2])
-    if not target.exists():
-        with target.open("x", encoding="utf-8") as stream:
-            json.dump({"services": {name: {"ports": [f"127.0.0.1:{port}:{port}"]}}}, stream)
+    local_service["ports"] = [f"127.0.0.1:{port}:{port}"]
+if not target.exists():
+    with target.open("x", encoding="utf-8") as stream:
+        json.dump({"services": {name: local_service}}, stream)
+else:
+    print("保留已有 Compose 覆盖配置，请确认其中的下载目录挂载与应用配置一致。")
 for network in config.get("networks", {}).values():
     if network.get("external"):
         network_name = network["name"]
@@ -175,6 +224,8 @@ PY
     APP_PASSWORD="$(python3 -c 'import json; print(json.load(open("config.json"))["app_password"])')"
     FLASK_SECRET_KEY="$(python3 -c 'import json; print(json.load(open("config.json"))["secret_key"])')"
     export APP_PASSWORD FLASK_SECRET_KEY
+    download_dir="$(python3 -c 'import json; print(json.load(open("config.json"))["host_download_dir"])')"
+    mkdir -p -- "$download_dir/Sub/ASS-to-SUP"
     bash ./deploy.sh
     echo '私有应用已部署；新增的访问端口仅绑定 127.0.0.1，可使用 SSH 隧道或自行配置反向代理。'
 )
@@ -191,10 +242,15 @@ run_action() {
 }
 
 run_selected() {
-    local id status failures=0
+    local id status failures=0 aria2_failed=0
     # 基础服务在前，私有应用随后，可能重启的网络/内核工具最后。
     for id in 1 4 5 2 3; do
         [[ " ${selected[*]} " == *" $id "* ]] || continue
+        if [[ $id == 2 && $aria2_failed == 1 ]]; then
+            echo 'Aria2 安装失败，跳过依赖它的私有应用。' >&2
+            failures=$((failures + 1))
+            continue
+        fi
         echo "========== 开始第 $id 项 =========="
         # 不把函数放进 if/||，否则 Bash 会禁用函数内部的 errexit。
         set +e
@@ -204,6 +260,7 @@ run_selected() {
         if (( status == 0 )); then
             echo "第 $id 项执行结束。"
         else
+            if [[ $id == 4 ]]; then aria2_failed=1; fi
             echo "第 $id 项失败（退出码 $status），继续其他选中项。" >&2
             failures=$((failures + 1))
         fi
@@ -224,7 +281,7 @@ main() {
     [[ -t 0 ]] || exec </dev/tty
     cat <<'MENU'
 1. Docker + Docker Compose 插件
-2. 私有应用（自动检查 Docker；可选导入微软雅黑）
+2. 私有应用（先进行 Aria2，自动读取目录和 RPC 密钥；可选导入微软雅黑）
 3. TCP/BBR/内核调优（可能重启，最后执行）
 4. Aria2
 5. OpenList v4
@@ -232,8 +289,7 @@ a. 全选
 0. 退出
 单选输入 1，多选输入 1 2 4 或 1,2,4。
 Aria2/OpenList/调优工具会进入各自的交互菜单，退出后继续下一项。
-若要配合私有应用使用，Aria2 下载目录请设为 /hash/download，
-并在 OpenList 中添加指向 /hash/download 的本地存储。
+私有应用自动读取 Aria2 下载目录；OpenList 本地存储请选择同一目录。
 MENU
     while true; do
         read -r -p '请选择：' input || return 0
