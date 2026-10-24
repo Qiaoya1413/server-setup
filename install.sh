@@ -163,8 +163,8 @@ if options.get("rpc-secure", "false") != "false":
 config.update(host_download_dir=download_dir, aria2_secret=secret,
               aria2_rpc_url=f"http://host.docker.internal:{int(port)}/jsonrpc")
 print("已读取 Aria2 下载目录与 RPC 配置（密钥不显示）。")
-with open("/dev/tty", "r+") as tty:
-    sys.stdin = tty
+with open("/dev/tty", "r") as tty_in, open("/dev/tty", "w") as tty_out:
+    sys.stdin = tty_in
     for key, label, default, hidden in (
         ("app_password", "应用登录密码", "", True),
         ("openlist_url", "OpenList 地址（容器访问宿主机）", "http://host.docker.internal:5244", False),
@@ -173,7 +173,7 @@ with open("/dev/tty", "r+") as tty:
     ):
         while True:
             prompt = label + (f" [{default}]" if default else "") + ": "
-            value = getpass.getpass(prompt, stream=tty) if hidden else input(prompt)
+            value = getpass.getpass(prompt, stream=tty_out) if hidden else input(prompt)
             value = value or default
             if value.strip():
                 config[key] = value
@@ -201,6 +201,8 @@ github_repo_name() {
 
 install_private_app() (
     local repo repo_name existing_repo project answer manifest override aria_config download_dir running
+    local settings="${1:-/root/.config/server-setup/private-app.conf}" saved_repo saved_project
+    local default_repo='' default_project=/hash/private-app settings_dir settings_temp
     aria_config=/root/.aria2c/aria2.conf
     if [[ ! -s $aria_config ]]; then
         read -r -p '未找到默认 Aria2 配置，请输入实际 aria2.conf 的绝对路径：' aria_config
@@ -208,20 +210,42 @@ install_private_app() (
     [[ $aria_config == /* && -s $aria_config ]] || fail '缺少 Aria2 配置，请先完成 Aria2 安装'
     install_docker
     install_packages git python3
-    read -r -p '私有仓库地址（HTTPS 或 git@github.com:用户名/仓库.git；不要包含 Token）：' repo
+    # 仅按两行数据读取本地默认值，不执行配置中的 Shell 内容。
+    if [[ -f $settings ]]; then
+        if { IFS= read -r saved_repo && IFS= read -r saved_project; } < "$settings" &&
+            github_repo_name "$saved_repo" >/dev/null &&
+            [[ $saved_project == /* && $saved_project != / && $saved_project != *:* ]]; then
+            default_repo="$saved_repo"
+            default_project="$saved_project"
+        else
+            echo '本地保存的地址或目录无效，请重新输入。'
+        fi
+    fi
+    read -r -p "私有仓库地址（HTTPS 或 SSH，不要包含 Token）${default_repo:+ [$default_repo]}：" repo
+    repo="${repo:-$default_repo}"
     repo_name="$(github_repo_name "$repo")" || fail '请输入不含凭据的 GitHub HTTPS 或 SSH 仓库地址'
     if [[ $repo == git@github.com:* ]]; then
         install_packages openssh-client
     fi
-    read -r -p '安装目录 [/hash/private-app]：' project
-    project="${project:-/hash/private-app}"
+    read -r -p "安装目录 [$default_project]：" project
+    project="${project:-$default_project}"
     [[ $project == /* && $project != / && $project != *:* ]] || fail '安装目录必须为绝对路径，不能为根目录或包含冒号'
     if [[ -e $project ]]; then
         [[ -d $project/.git ]] || fail '目录已存在且不是 Git 仓库，拒绝覆盖'
         existing_repo="$(git -C "$project" remote get-url origin)"
         [[ $(github_repo_name "$existing_repo") == "$repo_name" ]] || fail '已有目录的仓库地址不一致，拒绝覆盖'
         echo '保留已有代码和数据，不自动拉取或重置。'
-    else
+    fi
+    settings_dir="$(dirname -- "$settings")"
+    mkdir -p -- "$settings_dir"
+    chmod 700 -- "$settings_dir"
+    settings_temp="$(mktemp "$settings_dir/.private-app.XXXXXX")"
+    trap 'rm -f -- "$settings_temp"' EXIT
+    printf '%s\n%s\n' "$repo" "$project" > "$settings_temp"
+    chmod 600 -- "$settings_temp"
+    mv -f -- "$settings_temp" "$settings"
+    echo "仓库地址和安装目录已保存到本机：$settings（不保存认证凭据）。"
+    if [[ ! -e $project ]]; then
         if [[ $repo == git@github.com:* ]]; then
             echo '使用服务器现有 SSH 密钥；请先将公钥添加为该仓库的只读 Deploy key。'
         else

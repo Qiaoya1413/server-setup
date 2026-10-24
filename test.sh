@@ -147,8 +147,46 @@ done
         echo git@github.com:example/private.git
         echo "$work/private-app"
     } > "$work/private-input"
-    install_private_app < "$work/private-input" > "$work/private-result"
+    settings="$work/local-settings/private-app.conf"
+    install_private_app "$settings" < "$work/private-input" > "$work/private-result"
     [[ $(cat "$work/private-result") == *'私有应用已在运行，跳过重复部署'* ]]
+    [[ $(cat "$settings") == $'git@github.com:example/private.git\n'"$work/private-app" ]]
+    if [[ $OSTYPE != msys* ]]; then
+        [[ $(stat -c %a "$settings") == 600 && $(stat -c %a "${settings%/*}") == 700 ]]
+    fi
+    {
+        if [[ ! -s /root/.aria2c/aria2.conf ]]; then echo "$work/aria2.conf"; fi
+        printf '\n\n'
+    } > "$work/reuse-input"
+    install_private_app "$settings" < "$work/reuse-input" > "$work/private-result"
+    [[ $(cat "$work/private-result") == *'私有应用已在运行，跳过重复部署'* ]]
+    # 目录中的空格和 Shell 字符按字面值保存；显式输入可替换旧默认值。
+    project="$work/private app \$(touch unexpected)"
+    mkdir -p "$project/.git"
+    touch "$project/deploy.sh" "$project/docker-compose.yml" "$project/config.example.json"
+    {
+        if [[ ! -s /root/.aria2c/aria2.conf ]]; then echo "$work/aria2.conf"; fi
+        printf '%s\n' https://github.com/example/private.git "$project"
+    } > "$work/changed-input"
+    install_private_app "$settings" < "$work/changed-input" > /dev/null
+    [[ $(cat "$settings") == $'https://github.com/example/private.git\n'"$project" ]]
+    install_private_app "$settings" < "$work/reuse-input" > /dev/null
+    [[ $(cat "$settings") == $'https://github.com/example/private.git\n'"$project" ]]
+    cp "$settings" "$work/settings-before"
+    {
+        if [[ ! -s /root/.aria2c/aria2.conf ]]; then echo "$work/aria2.conf"; fi
+        printf '%s\n' https://github.com/example/private.git relative/path
+    } > "$work/invalid-input"
+    set +e
+    (set -e; install_private_app "$settings" < "$work/invalid-input") > /dev/null 2>&1
+    status=$?
+    set -e
+    [[ $status != 0 ]]
+    cmp "$settings" "$work/settings-before"
+    printf '%s\n' "\$(touch '$work/unexpected')" /tmp > "$settings"
+    install_private_app "$settings" < "$work/private-input" > /dev/null
+    [[ ! -e $work/unexpected ]]
+    [[ $(cat "$settings") == $'git@github.com:example/private.git\n'"$work/private-app" ]]
 )
 
 # SSH 克隆使用原生 Git/SSH，不关闭服务器身份校验，也不在 URL 中保存凭据。
@@ -167,7 +205,7 @@ done
         echo git@github.com:example/private.git
         echo "$work/private-ssh-app"
     } > "$work/ssh-input"
-    install_private_app < "$work/ssh-input" > "$work/ssh-result"
+    install_private_app "$work/ssh-settings/private-app.conf" < "$work/ssh-input" > "$work/ssh-result"
     [[ $(cat "$work/ssh-packages") == $'git python3\nopenssh-client' ]]
     [[ $(cat "$work/ssh-clone") == clone ]]
 )
@@ -259,7 +297,12 @@ with tempfile.TemporaryDirectory() as temp:
     real_open = open
 
     def fake_open(name, *args, **kwargs):
-        return io.StringIO() if name == "/dev/tty" else real_open(name, *args, **kwargs)
+        if name == "/dev/tty":
+            # 终端不支持 r+ 所需的 seek；读写流必须分别打开。
+            if "+" in args[0]:
+                raise io.UnsupportedOperation("File or stream is not seekable.")
+            return io.StringIO()
+        return real_open(name, *args, **kwargs)
 
     with patch.object(sys, "argv", ["check", temp, str(aria)]), patch.object(sys, "stdin"), patch("builtins.open", side_effect=fake_open), patch("builtins.input", return_value=""), patch("getpass.getpass", return_value="test-only-secret") as password_prompt:
         exec(parts[0], {})
