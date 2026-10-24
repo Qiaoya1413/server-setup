@@ -200,7 +200,7 @@ github_repo_name() {
 }
 
 install_private_app() (
-    local repo repo_name existing_repo project answer manifest override aria_config download_dir running
+    local repo repo_name existing_repo project answer manifest override aria_config download_dir running access
     local settings="${1:-/root/.config/server-setup/private-app.conf}" saved_repo saved_project
     local default_repo='' default_project=/hash/private-app settings_dir settings_temp
     aria_config=/root/.aria2c/aria2.conf
@@ -262,24 +262,34 @@ install_private_app() (
     [[ -f deploy.sh && -f docker-compose.yml && -f config.example.json ]] || fail '该安装项需要 deploy.sh、docker-compose.yml 和 config.example.json'
     running="$(docker compose -f docker-compose.yml ps --status running --quiet)"
     if [[ -n $running ]]; then
+        echo '私有应用已在运行，可仅修改访问方式，保留现有配置及数据。'
+    else
+        echo '继续会执行该私库的 deploy.sh；请仅使用你信任的仓库。'
+        read -r -p '继续部署？[y/N] ' answer
+        [[ $answer == y || $answer == Y ]] || { echo '已取消部署。'; return 0; }
+        prepare_config "$project" "$aria_config"
+        install_fonts "$project/fonts"
+    fi
+    echo '访问方式：0. 保持现有设置（首次默认仅本机）  1. 仅本机  2. 直接 IP+端口（HTTP，登录信息不加密）'
+    read -r -p '请选择 [0]：' access
+    access="${access:-0}"
+    [[ $access =~ ^[012]$ ]] || fail '访问方式只能选择 0、1 或 2'
+    if [[ -n $running && $access == 0 ]]; then
         echo '私有应用已在运行，跳过重复部署，保留现有配置及数据。'
         return 0
     fi
-    echo '继续会执行该私库的 deploy.sh；请仅使用你信任的仓库。'
-    read -r -p '继续部署？[y/N] ' answer
-    [[ $answer == y || $answer == Y ]] || { echo '已取消部署。'; return 0; }
-    prepare_config "$project" "$aria_config"
-    install_fonts "$project/fonts"
     manifest="$(mktemp)"
     trap 'rm -f -- "$manifest"' EXIT
     docker compose -f docker-compose.yml config --format json > "$manifest"
     override="$project/compose.install.json"
     # 从私库配置读取服务名、端口和外部网络，不在公开脚本中记录私库信息。
-    python3 - "$manifest" "$override" <<'PY'
+    python3 - "$manifest" "$override" "$access" "$running" <<'PY'
 import json
+import os
 from pathlib import Path
 import subprocess
 import sys
+import tempfile
 
 config = json.loads(Path(sys.argv[1]).read_text())
 services = config["services"]
@@ -287,6 +297,7 @@ if len(services) != 1:
     raise SystemExit("此安装项仅支持单服务 Compose 项目。")
 name, service = next(iter(services.items()))
 target = Path(sys.argv[2])
+access = sys.argv[3]
 app_config = json.loads((target.parent / "config.json").read_text(encoding="utf-8"))
 download_dir = app_config["host_download_dir"]
 local_service = {}
@@ -309,11 +320,41 @@ if not service.get("ports"):
         raise SystemExit("需要在 Compose 中声明唯一 expose 端口，或自行配置 ports。")
     port = int(exposed[0])
     local_service["ports"] = [f"127.0.0.1:{port}:{port}"]
-if not target.exists():
-    with target.open("x", encoding="utf-8") as stream:
-        json.dump({"services": {name: local_service}}, stream)
-else:
+document = json.loads(target.read_text(encoding="utf-8")) if target.exists() else {"services": {name: local_service}}
+if access != "0":
+    if service.get("ports"):
+        raise SystemExit("基础 Compose 已声明 ports，请先将其移至 compose.install.json，避免叠加冲突的端口映射。")
+    host = "0.0.0.0" if access == "2" else "127.0.0.1"
+    updated_service = document.setdefault("services", {}).setdefault(name, {})
+    updated_service["ports"] = [f"{host}:{port}:{port}"]
+    if sys.argv[4]:
+        # 部署脚本可能临时设置了挂载路径；复用运行容器的路径，避免恢复为 Compose 默认值。
+        container = json.loads(subprocess.check_output(["docker", "inspect", sys.argv[4]], text=True))[0]
+        binds = [{"type": "bind", "source": mount["Source"], "target": mount["Destination"], "read_only": not mount["RW"]}
+                 for mount in container["Mounts"] if mount["Type"] == "bind"]
+        targets = {mount["target"] for mount in binds}
+        updated_service["volumes"] = [volume for volume in updated_service.get("volumes", []) if volume["target"] not in targets] + binds
+if not target.exists() or access != "0":
+    if target.exists():
+        fd, backup = tempfile.mkstemp(prefix=target.name + ".backup.", suffix=".save", dir=target.parent)
+        with os.fdopen(fd, "wb") as stream:
+            stream.write(target.read_bytes())
+        print(f"原 Compose 覆盖配置已备份：{backup}")
+    with tempfile.NamedTemporaryFile(mode="w", encoding="utf-8", dir=target.parent, delete=False) as stream:
+        temporary = Path(stream.name)
+        try:
+            json.dump(document, stream, ensure_ascii=False, indent=2)
+            stream.write("\n")
+            stream.close()
+            os.replace(temporary, target)
+        finally:
+            temporary.unlink(missing_ok=True)
+elif target.exists():
     print("保留已有 Compose 覆盖配置，请确认其中的下载目录挂载与应用配置一致。")
+if access == "2":
+    print(f"直接访问地址：http://服务器IP:{port}；请确保服务器防火墙及云安全组允许此 TCP 端口。")
+elif access == "1":
+    print("访问端口仅绑定 127.0.0.1。")
 for network in config.get("networks", {}).values():
     if network.get("external"):
         network_name = network["name"]
@@ -328,10 +369,16 @@ PY
     APP_PASSWORD="$(python3 -c 'import json; print(json.load(open("config.json"))["app_password"])')"
     FLASK_SECRET_KEY="$(python3 -c 'import json; print(json.load(open("config.json"))["secret_key"])')"
     export APP_PASSWORD FLASK_SECRET_KEY
-    download_dir="$(python3 -c 'import json; print(json.load(open("config.json"))["host_download_dir"])')"
-    mkdir -p -- "$download_dir/Sub/ASS-to-SUP"
-    bash ./deploy.sh
-    echo '私有应用已部署；新增的访问端口仅绑定 127.0.0.1，可使用 SSH 隧道或自行配置反向代理。'
+    if [[ -n $running ]]; then
+        docker compose up -d --no-build
+        docker compose ps
+        echo '私有应用访问方式已更新，未重新构建镜像。'
+    else
+        download_dir="$(python3 -c 'import json; print(json.load(open("config.json"))["host_download_dir"])')"
+        mkdir -p -- "$download_dir/Sub/ASS-to-SUP"
+        bash ./deploy.sh
+        echo '私有应用已部署，访问端口见上方输出。'
+    fi
 )
 
 run_action() {

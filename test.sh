@@ -146,6 +146,7 @@ done
         if [[ ! -s /root/.aria2c/aria2.conf ]]; then echo "$work/aria2.conf"; fi
         echo git@github.com:example/private.git
         echo "$work/private-app"
+        echo 0
     } > "$work/private-input"
     settings="$work/local-settings/private-app.conf"
     install_private_app "$settings" < "$work/private-input" > "$work/private-result"
@@ -156,7 +157,7 @@ done
     fi
     {
         if [[ ! -s /root/.aria2c/aria2.conf ]]; then echo "$work/aria2.conf"; fi
-        printf '\n\n'
+        printf '\n\n\n'
     } > "$work/reuse-input"
     install_private_app "$settings" < "$work/reuse-input" > "$work/private-result"
     [[ $(cat "$work/private-result") == *'私有应用已在运行，跳过重复部署'* ]]
@@ -167,6 +168,7 @@ done
     {
         if [[ ! -s /root/.aria2c/aria2.conf ]]; then echo "$work/aria2.conf"; fi
         printf '%s\n' https://github.com/example/private.git "$project"
+        echo 0
     } > "$work/changed-input"
     install_private_app "$settings" < "$work/changed-input" > /dev/null
     [[ $(cat "$settings") == $'https://github.com/example/private.git\n'"$project" ]]
@@ -187,6 +189,36 @@ done
     install_private_app "$settings" < "$work/private-input" > /dev/null
     [[ ! -e $work/unexpected ]]
     [[ $(cat "$settings") == $'git@github.com:example/private.git\n'"$work/private-app" ]]
+    # 已运行时选择直接访问，只应用 Compose，不执行部署脚本或重建镜像。
+    docker() {
+        case "$*" in
+            'compose -f docker-compose.yml ps --status running --quiet') echo example-running-id ;;
+            'compose -f docker-compose.yml config --format json') echo '{}' ;;
+            'compose up -d --no-build')
+                [[ $COMPOSE_FILE == "$work/private-app/docker-compose.yml:$work/private-app/compose.install.json" ]]
+                echo "$*" > "$work/access-up" ;;
+            'compose ps') ;;
+            *) fail '不应构建镜像或执行其他 Docker 操作' ;;
+        esac
+    }
+    python3() {
+        if [[ $1 == - ]]; then
+            [[ $4 == 2 ]]
+            cat >/dev/null
+            echo '{}' > "$3"
+        else
+            [[ $1 == -c ]]
+            echo test-only-value
+        fi
+    }
+    bash() { fail '不应重复执行部署脚本'; }
+    {
+        if [[ ! -s /root/.aria2c/aria2.conf ]]; then echo "$work/aria2.conf"; fi
+        printf '%s\n' '' '' 2
+    } > "$work/access-input"
+    install_private_app "$settings" < "$work/access-input" > "$work/access-result"
+    [[ $(cat "$work/access-up") == 'compose up -d --no-build' ]]
+    [[ $(cat "$work/access-result") == *'私有应用访问方式已更新，未重新构建镜像。'* ]]
 )
 
 # SSH 克隆使用原生 Git/SSH，不关闭服务器身份校验，也不在 URL 中保存凭据。
@@ -204,6 +236,7 @@ done
         if [[ ! -s /root/.aria2c/aria2.conf ]]; then echo "$work/aria2.conf"; fi
         echo git@github.com:example/private.git
         echo "$work/private-ssh-app"
+        echo 0
     } > "$work/ssh-input"
     install_private_app "$work/ssh-settings/private-app.conf" < "$work/ssh-input" > "$work/ssh-result"
     [[ $(cat "$work/ssh-packages") == $'git python3\nopenssh-client' ]]
@@ -359,7 +392,7 @@ with tempfile.TemporaryDirectory() as temp:
         calls.append(args)
         return SimpleNamespace(returncode=1 if "inspect" in args else 0)
 
-    with patch.object(sys, "argv", ["check", str(manifest), str(override)]), patch("subprocess.run", side_effect=fake_run):
+    with patch.object(sys, "argv", ["check", str(manifest), str(override), "0", ""]), patch("subprocess.run", side_effect=fake_run):
         exec(parts[1], {})
         service = json.loads(override.read_text())["services"]["example"]
         assert service["ports"] == ["127.0.0.1:5090:5090"]
@@ -369,6 +402,43 @@ with tempfile.TemporaryDirectory() as temp:
         override.write_text('{"keep": "existing override"}')
         exec(parts[1], {})
         assert json.loads(override.read_text()) == {"keep": "existing override"}
+    # 已有部署仅切换端口绑定，保留其他覆盖项，并备份切换前的文件。
+    original = {"services": {"example": {"ports": ["127.0.0.1:5090:5090"], "environment": {"KEEP": "yes"}, "volumes": [{"type": "bind", "source": "/custom", "target": "/custom"}]}}, "keep": "unchanged"}
+    override.write_text(json.dumps(original))
+    for access, host in (("2", "0.0.0.0"), ("1", "127.0.0.1")):
+        previous = override.read_bytes()
+        backups_before = set(root.glob("compose.install.json.backup.*.save"))
+        with patch.object(sys, "argv", ["check", str(manifest), str(override), access, ""]), patch("subprocess.run", side_effect=fake_run):
+            exec(parts[1], {})
+        backups = set(root.glob("compose.install.json.backup.*.save")) - backups_before
+        assert len(backups) == 1 and next(iter(backups)).read_bytes() == previous
+        changed = json.loads(override.read_text())
+        assert changed["services"]["example"]["ports"] == [f"{host}:5090:5090"]
+        changed["services"]["example"]["ports"] = original["services"]["example"]["ports"]
+        assert changed == original
+    override.unlink()
+    with patch.object(sys, "argv", ["check", str(manifest), str(override), "2", ""]), patch("subprocess.run", side_effect=fake_run):
+        exec(parts[1], {})
+    assert json.loads(override.read_text())["services"]["example"]["ports"] == ["0.0.0.0:5090:5090"]
+    runtime = [{"Mounts": [{"Type": "bind", "Source": "/srv/existing/config.json", "Destination": "/app/config.json", "RW": True}, {"Type": "bind", "Source": "/srv/existing/fonts", "Destination": "/app/fonts", "RW": False}]}]
+    with patch.object(sys, "argv", ["check", str(manifest), str(override), "2", "example-running-id"]), patch("subprocess.run", side_effect=fake_run), patch("subprocess.check_output", return_value=json.dumps(runtime)) as inspect:
+        exec(parts[1], {})
+        inspect.assert_called_once_with(["docker", "inspect", "example-running-id"], text=True)
+    mounted = {volume["target"]: volume for volume in json.loads(override.read_text())["services"]["example"]["volumes"]}
+    assert mounted["/app/config.json"]["source"] == "/srv/existing/config.json"
+    assert mounted["/app/fonts"]["source"] == "/srv/existing/fonts" and mounted["/app/fonts"]["read_only"] is True
+    # 基础文件已有映射时拒绝叠加，避免两个 host_ip 导致端口占用。
+    previous = override.read_bytes()
+    data["services"]["example"]["ports"] = [{"target": 5090, "published": "5090", "host_ip": "127.0.0.1", "protocol": "tcp"}]
+    manifest.write_text(json.dumps(data))
+    with patch.object(sys, "argv", ["check", str(manifest), str(override), "2", ""]), patch("subprocess.run", side_effect=fake_run):
+        try:
+            exec(parts[1], {})
+        except SystemExit as exc:
+            assert exc.code
+        else:
+            raise AssertionError("conflicting base ports accepted")
+    assert override.read_bytes() == previous
 print("PASS: Aria2 自动配置、无效配置拒绝、已有配置保护、Compose 下载目录挂载。")
 PY
 echo 'PASS: 选择解析、安装顺序、去重、失败隔离、下载失败和字体保护。'
