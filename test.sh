@@ -69,8 +69,10 @@ cp "$work/apt/sources.list" "$work/original.list"
 
 parse_selection '2'
 [[ ${selected[*]} == '2 4' ]]
+[[ $aria2_dependency == 1 ]]
 parse_selection '1,2 4,4'
 [[ ${selected[*]} == '1 2 4 4' ]]
+[[ $aria2_dependency == 0 ]]
 parse_selection a
 [[ ${selected[*]} == '1 2 3 4 5' ]]
 for invalid in '' 0 6 12 '1 two' '1;id' 'a 1'; do
@@ -78,6 +80,69 @@ for invalid in '' 0 6 12 '1 two' '1;id' 'a 1'; do
         fail "错误接受了输入：$invalid"
     fi
 done
+
+# 自动依赖复用已有 Aria2；显式选择管理项仍打开菜单，缺失时才安装。
+(
+    aria2_present=1
+    command() {
+        if [[ $* == '-v aria2c' ]]; then
+            [[ $aria2_present == 1 ]]
+        else
+            builtin command "$@"
+        fi
+    }
+    run_remote() { echo remote >> "$work/aria2-install"; }
+    parse_selection 2
+    run_action 4
+    [[ ! -e $work/aria2-install ]]
+    parse_selection '2 4'
+    run_action 4
+    [[ $(wc -l < "$work/aria2-install") == 1 ]]
+    aria2_present=0
+    parse_selection 2
+    run_action 4
+    [[ $(wc -l < "$work/aria2-install") == 2 ]]
+)
+
+# Docker/Compose 已就绪时不调用安装器或更改服务；仅服务未启动时补启动。
+(
+    docker_ready=1
+    command() { [[ $* == '-v docker' ]] || builtin command "$@"; }
+    docker() {
+        if [[ $* == info ]]; then [[ $docker_ready == 1 ]]; fi
+    }
+    run_remote() { fail '不应重复安装 Docker'; }
+    install_packages() { fail '不应重复安装 Compose'; }
+    systemctl() { echo "$*" >> "$work/docker-service"; docker_ready=1; }
+    install_docker
+    [[ ! -e $work/docker-service ]]
+    docker_ready=0
+    install_docker
+    [[ $(cat "$work/docker-service") == 'enable --now docker' ]]
+)
+
+# 已运行的私有应用直接跳过，不进入配置、字体或部署步骤。
+(
+    mkdir -p "$work/private-app/.git"
+    touch "$work/private-app/deploy.sh" "$work/private-app/docker-compose.yml" "$work/private-app/config.example.json"
+    echo test > "$work/aria2.conf"
+    install_docker() { :; }
+    install_packages() { :; }
+    git() { echo https://github.com/example/private.git; }
+    docker() {
+        [[ $* == 'compose -f docker-compose.yml ps --status running --quiet' ]] || fail '不应变更已有应用'
+        echo example-running-id
+    }
+    prepare_config() { fail '不应改写已有应用配置'; }
+    install_fonts() { fail '不应改写已有字体'; }
+    {
+        if [[ ! -s /root/.aria2c/aria2.conf ]]; then echo "$work/aria2.conf"; fi
+        echo https://github.com/example/private.git
+        echo "$work/private-app"
+    } > "$work/private-input"
+    install_private_app < "$work/private-input" > "$work/private-result"
+    [[ $(cat "$work/private-result") == *'私有应用已在运行，跳过重复部署'* ]]
+)
 
 # 用假的安装动作检查顺序、去重与失败隔离，不下载、不安装。
 fail_aria2=1

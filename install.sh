@@ -7,6 +7,7 @@ fail() { echo "错误：$*" >&2; exit 1; }
 parse_selection() {
     local input="${1//,/ }" item
     selected=()
+    aria2_dependency=0
     read -r -a selected <<< "$input"
     [[ ${#selected[@]} -gt 0 ]] || return 1
     if [[ ${#selected[@]} == 1 && ${selected[0]} == a ]]; then
@@ -17,6 +18,7 @@ parse_selection() {
     done
     if [[ " ${selected[*]} " == *' 2 '* && " ${selected[*]} " != *' 4 '* ]]; then
         selected+=(4)
+        aria2_dependency=1
     fi
 }
 
@@ -78,7 +80,19 @@ run_remote() (
     bash "./$name"
 )
 
+install_aria2() {
+    if [[ ${1:-} == --if-missing ]] && command -v aria2c >/dev/null 2>&1; then
+        echo 'Aria2 已安装，复用现有配置，跳过安装及管理菜单。'
+        return 0
+    fi
+    run_remote https://git.io/aria2.sh aria2.sh https://raw.githubusercontent.com/P3TERX/aria2.sh/master/aria2.sh
+}
+
 install_docker() {
+    if command -v docker >/dev/null 2>&1 && docker compose version >/dev/null 2>&1 && docker info >/dev/null 2>&1; then
+        echo 'Docker 和 Compose 已就绪，跳过安装及服务变更。'
+        return 0
+    fi
     if ! command -v docker >/dev/null 2>&1; then
         run_remote https://get.docker.com get-docker.sh
     fi
@@ -175,7 +189,7 @@ PY
 }
 
 install_private_app() (
-    local repo project answer manifest override aria_config download_dir
+    local repo project answer manifest override aria_config download_dir running
     aria_config=/root/.aria2c/aria2.conf
     if [[ ! -s $aria_config ]]; then
         read -r -p '未找到默认 Aria2 配置，请输入实际 aria2.conf 的绝对路径：' aria_config
@@ -198,6 +212,11 @@ install_private_app() (
     fi
     cd "$project"
     [[ -f deploy.sh && -f docker-compose.yml && -f config.example.json ]] || fail '该安装项需要 deploy.sh、docker-compose.yml 和 config.example.json'
+    running="$(docker compose -f docker-compose.yml ps --status running --quiet)"
+    if [[ -n $running ]]; then
+        echo '私有应用已在运行，跳过重复部署，保留现有配置及数据。'
+        return 0
+    fi
     echo '继续会执行该私库的 deploy.sh；请仅使用你信任的仓库。'
     read -r -p '继续部署？[y/N] ' answer
     [[ $answer == y || $answer == Y ]] || { echo '已取消部署。'; return 0; }
@@ -272,7 +291,13 @@ run_action() {
         1) install_docker ;;
         2) install_private_app ;;
         3) run_remote https://github.com/ylx2016/Linux-NetSpeed/raw/master/tcpx.sh tcpx.sh ;;
-        4) run_remote https://git.io/aria2.sh aria2.sh https://raw.githubusercontent.com/P3TERX/aria2.sh/master/aria2.sh ;;
+        4)
+            if [[ ${aria2_dependency:-0} == 1 ]]; then
+                install_aria2 --if-missing
+            else
+                install_aria2
+            fi
+            ;;
         5) run_remote https://res.oplist.org/script/v4.sh install-openlist-v4.sh ;;
         *) fail '未知安装项' ;;
     esac
@@ -318,7 +343,7 @@ main() {
     [[ -t 0 ]] || exec </dev/tty
     cat <<'MENU'
 1. Docker + Docker Compose 插件
-2. 私有应用（先进行 Aria2，自动读取目录和 RPC 密钥；可选导入微软雅黑）
+2. 私有应用（复用已安装依赖，缺失时先装 Aria2；可选导入微软雅黑）
 3. TCP/BBR/内核调优（可能重启，最后执行）
 4. Aria2
 5. OpenList v4
