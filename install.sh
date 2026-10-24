@@ -27,11 +27,14 @@ repair_apt_sources() (
     trap 'rm -rf -- "$work"' EXIT
     for file in "$apt_dir/sources.list" "$apt_dir/sources.list.d/"*.list; do
         [[ -f $file ]] || continue
-        # 只禁用已退役的官方 bullseye-backports，不改仍可用的镜像、主源及安全源。
+        # Bullseye 安全更新已归档；索引仍可能命中，但原站的软件包已被移走。
         awk '
             /^[[:space:]]*deb(-src)?[[:space:]]+(\[[^]]*\][[:space:]]+)?https?:\/\/(deb|ftp)\.debian\.org\/debian\/?[[:space:]]+bullseye-backports([[:space:]]|$)/ {
                 print "# server-setup: disabled retired backports: " $0
                 next
+            }
+            /^[[:space:]]*deb(-src)?[[:space:]]+(\[[^]]*\][[:space:]]+)?https?:\/\/(security\.debian\.org\/debian-security|deb\.debian\.org\/debian-security|mirror\.hetzner\.com\/debian\/security)\/?[[:space:]]+bullseye-security([[:space:]]|$)/ {
+                sub(/https?:\/\/[^[:space:]]+/, "https://archive.debian.org/debian-security")
             }
             { print }
         ' "$file" > "$work/sources"
@@ -39,7 +42,7 @@ repair_apt_sources() (
         backup="$(mktemp --suffix=.save "${file}.server-setup-backup.XXXXXX")"
         cp -p -- "$file" "$backup"
         cat "$work/sources" > "$file"
-        echo "已禁用失效的官方 bullseye-backports 条目；备份：$backup"
+        echo "已修复退役的 Bullseye APT 条目；原文件备份：$backup"
     done
 )
 
@@ -55,7 +58,7 @@ install_packages() {
         echo '所需系统依赖已安装，跳过重复安装。'
         return 0
     fi
-    apt-get update || fail 'APT 更新失败，已停止安装；请检查上方报错中的软件源，脚本不会绕过签名校验。'
+    apt-get -o Acquire::Retries=3 -o APT::Update::Error-Mode=any update || fail 'APT 更新失败，已停止安装；请检查上方报错中的软件源，脚本不会绕过签名校验。'
     DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends "${missing[@]}" || fail '系统依赖安装失败，已停止当前步骤。'
 }
 

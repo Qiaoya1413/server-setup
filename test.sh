@@ -5,7 +5,7 @@ source ./install.sh
 work="$(mktemp -d)"
 trap 'rm -rf -- "$work"' EXIT
 
-# 只处理已退役的官方 backports 条目，保留仍可用镜像及其他源，并能回滚。
+# 修复退役的 backports 和安全源，保留其他源与校验选项，并能回滚。
 mkdir -p "$work/apt/sources.list.d"
 cat > "$work/apt/sources.list" <<'LIST'
 deb http://deb.debian.org/debian bullseye main
@@ -13,6 +13,11 @@ deb http://deb.debian.org/debian bullseye-backports main
 deb-src [signed-by=/usr/share/keyrings/debian.gpg] https://deb.debian.org/debian/ bullseye-backports main
 # deb http://deb.debian.org/debian bullseye-backports main
 deb http://mirror.hetzner.com/debian/packages bullseye-backports main
+deb http://security.debian.org/debian-security bullseye-security main
+deb http://mirror.hetzner.com/debian/security bullseye-security main
+deb-src [signed-by=/usr/share/keyrings/debian.gpg] https://deb.debian.org/debian-security/ bullseye-security main contrib
+# deb http://security.debian.org/debian-security bullseye-security main
+deb https://security.debian.org/debian-security bookworm-security main
 deb https://download.docker.com/linux/debian bullseye stable
 LIST
 cp "$work/apt/sources.list" "$work/original.list"
@@ -22,6 +27,10 @@ cp "$work/apt/sources.list" "$work/original.list"
     [[ $(awk '/^# server-setup:/{n++} END{print n+0}' "$work/apt/sources.list") == 2 ]]
     [[ $(cat "$work/apt/sources.list") == *'deb http://mirror.hetzner.com/debian/packages bullseye-backports main'* ]]
     [[ $(cat "$work/apt/sources.list") == *'deb https://download.docker.com/linux/debian bullseye stable'* ]]
+    [[ $(awk '/^[^#].*archive.debian.org\/debian-security/{n++} END{print n+0}' "$work/apt/sources.list") == 3 ]]
+    [[ $(cat "$work/apt/sources.list") == *'deb-src [signed-by=/usr/share/keyrings/debian.gpg] https://archive.debian.org/debian-security bullseye-security main contrib'* ]]
+    [[ $(cat "$work/apt/sources.list") == *'# deb http://security.debian.org/debian-security bullseye-security main'* ]]
+    [[ $(cat "$work/apt/sources.list") == *'deb https://security.debian.org/debian-security bookworm-security main'* ]]
     backups=("$work/apt/sources.list".server-setup-backup.*)
     [[ ${#backups[@]} == 1 ]]
     cmp "$work/original.list" "${backups[0]}"
@@ -45,7 +54,7 @@ cp "$work/apt/sources.list" "$work/original.list"
     }
     apt-get() { echo "$*" >> "$work/apt-order"; }
     install_packages curl wget
-    [[ $(cat "$work/apt-order") == $'repair\nupdate\ninstall -y --no-install-recommends wget' ]]
+    [[ $(cat "$work/apt-order") == $'repair\n-o Acquire::Retries=3 -o APT::Update::Error-Mode=any update\ninstall -y --no-install-recommends wget' ]]
     rm "$work/apt-order"
     install_packages curl
     [[ $(cat "$work/apt-order") == repair ]]
@@ -55,7 +64,7 @@ cp "$work/apt/sources.list" "$work/original.list"
     status=$?
     set -e
     [[ $status != 0 ]]
-    [[ $(cat "$work/apt-order") == $'repair\nrepair\nupdate' ]]
+    [[ $(cat "$work/apt-order") == $'repair\nrepair\n-o Acquire::Retries=3 -o APT::Update::Error-Mode=any update' ]]
 )
 
 parse_selection '2'
