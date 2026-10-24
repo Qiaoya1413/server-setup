@@ -121,7 +121,14 @@ done
     [[ $(cat "$work/docker-service") == 'enable --now docker' ]]
 )
 
-# 已运行的私有应用直接跳过，不进入配置、字体或部署步骤。
+# HTTPS 和 SSH 对应同一仓库；拒绝带密码、Token 或非 GitHub 地址。
+[[ $(github_repo_name https://github.com/Example/private.git) == example/private ]]
+[[ $(github_repo_name git@github.com:example/Private.git) == example/private ]]
+for invalid in 'https://user:secret@github.com/example/private.git' 'git@other.example:example/private.git' 'git@github.com:example/private;id.git' '-bad'; do
+    if github_repo_name "$invalid"; then fail '错误接受了仓库地址'; fi
+done
+
+# 已运行的私有应用直接跳过，且 HTTPS/SSH 切换不会误判为其他仓库。
 (
     mkdir -p "$work/private-app/.git"
     touch "$work/private-app/deploy.sh" "$work/private-app/docker-compose.yml" "$work/private-app/config.example.json"
@@ -137,11 +144,32 @@ done
     install_fonts() { fail '不应改写已有字体'; }
     {
         if [[ ! -s /root/.aria2c/aria2.conf ]]; then echo "$work/aria2.conf"; fi
-        echo https://github.com/example/private.git
+        echo git@github.com:example/private.git
         echo "$work/private-app"
     } > "$work/private-input"
     install_private_app < "$work/private-input" > "$work/private-result"
     [[ $(cat "$work/private-result") == *'私有应用已在运行，跳过重复部署'* ]]
+)
+
+# SSH 克隆使用原生 Git/SSH，不关闭服务器身份校验，也不在 URL 中保存凭据。
+(
+    install_docker() { :; }
+    install_packages() { echo "$*" >> "$work/ssh-packages"; }
+    git() {
+        [[ $* == '-c credential.helper= clone --depth 1 -- git@github.com:example/private.git '* ]] || fail 'SSH 克隆参数错误'
+        echo clone >> "$work/ssh-clone"
+        mkdir -p "$work/private-ssh-app/.git"
+        touch "$work/private-ssh-app/deploy.sh" "$work/private-ssh-app/docker-compose.yml" "$work/private-ssh-app/config.example.json"
+    }
+    docker() { echo example-running-id; }
+    {
+        if [[ ! -s /root/.aria2c/aria2.conf ]]; then echo "$work/aria2.conf"; fi
+        echo git@github.com:example/private.git
+        echo "$work/private-ssh-app"
+    } > "$work/ssh-input"
+    install_private_app < "$work/ssh-input" > "$work/ssh-result"
+    [[ $(cat "$work/ssh-packages") == $'git python3\nopenssh-client' ]]
+    [[ $(cat "$work/ssh-clone") == clone ]]
 )
 
 # 用假的安装动作检查顺序、去重与失败隔离，不下载、不安装。

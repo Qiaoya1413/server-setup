@@ -188,8 +188,19 @@ with os.fdopen(fd, "w", encoding="utf-8") as stream:
 PY
 }
 
+github_repo_name() {
+    local address="${1%.git}"
+    case "$address" in
+        https://github.com/*) address="${address#https://github.com/}" ;;
+        git@github.com:*) address="${address#git@github.com:}" ;;
+        *) return 1 ;;
+    esac
+    [[ $address =~ ^[A-Za-z0-9_-]+/[A-Za-z0-9_.-]+$ ]] || return 1
+    printf '%s\n' "${address,,}"
+}
+
 install_private_app() (
-    local repo project answer manifest override aria_config download_dir running
+    local repo repo_name existing_repo project answer manifest override aria_config download_dir running
     aria_config=/root/.aria2c/aria2.conf
     if [[ ! -s $aria_config ]]; then
         read -r -p '未找到默认 Aria2 配置，请输入实际 aria2.conf 的绝对路径：' aria_config
@@ -197,18 +208,31 @@ install_private_app() (
     [[ $aria_config == /* && -s $aria_config ]] || fail '缺少 Aria2 配置，请先完成 Aria2 安装'
     install_docker
     install_packages git python3
-    read -r -p '私有仓库地址（https://github.com/用户名/仓库.git，不要包含 Token）：' repo
-    [[ $repo =~ ^https://github\.com/[A-Za-z0-9_-]+/[A-Za-z0-9_.-]+(\.git)?$ ]] || fail '请输入不含凭据的 GitHub HTTPS 仓库地址'
+    read -r -p '私有仓库地址（HTTPS 或 git@github.com:用户名/仓库.git；不要包含 Token）：' repo
+    repo_name="$(github_repo_name "$repo")" || fail '请输入不含凭据的 GitHub HTTPS 或 SSH 仓库地址'
+    if [[ $repo == git@github.com:* ]]; then
+        install_packages openssh-client
+    fi
     read -r -p '安装目录 [/hash/private-app]：' project
     project="${project:-/hash/private-app}"
     [[ $project == /* && $project != / && $project != *:* ]] || fail '安装目录必须为绝对路径，不能为根目录或包含冒号'
     if [[ -e $project ]]; then
         [[ -d $project/.git ]] || fail '目录已存在且不是 Git 仓库，拒绝覆盖'
-        [[ $(git -C "$project" remote get-url origin) == "$repo" ]] || fail '已有目录的仓库地址不一致，拒绝覆盖'
+        existing_repo="$(git -C "$project" remote get-url origin)"
+        [[ $(github_repo_name "$existing_repo") == "$repo_name" ]] || fail '已有目录的仓库地址不一致，拒绝覆盖'
         echo '保留已有代码和数据，不自动拉取或重置。'
     else
-        echo 'Git 用户名输入 GitHub 用户名，Password 输入有该私库只读权限的 Token。'
-        git -c credential.helper= clone --depth 1 -- "$repo" "$project"
+        if [[ $repo == git@github.com:* ]]; then
+            echo '使用服务器现有 SSH 密钥；请先将公钥添加为该仓库的只读 Deploy key。'
+        else
+            echo 'Git 用户名输入 GitHub 用户名；Password 必须输入 Token，GitHub 不接受账号登录密码。'
+        fi
+        if ! git -c credential.helper= clone --depth 1 -- "$repo" "$project"; then
+            if [[ $repo == git@github.com:* ]]; then
+                fail 'SSH 克隆失败，请检查服务器公钥是否已授权给该仓库，以及 SSH 连接是否可用。'
+            fi
+            fail 'HTTPS 克隆失败；若为认证错误，请使用有该私库只读权限的 Token，或改用 SSH 地址。'
+        fi
     fi
     cd "$project"
     [[ -f deploy.sh && -f docker-compose.yml && -f config.example.json ]] || fail '该安装项需要 deploy.sh、docker-compose.yml 和 config.example.json'
