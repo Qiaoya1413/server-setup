@@ -5,6 +5,59 @@ source ./install.sh
 work="$(mktemp -d)"
 trap 'rm -rf -- "$work"' EXIT
 
+# 只处理已退役的官方 backports 条目，保留仍可用镜像及其他源，并能回滚。
+mkdir -p "$work/apt/sources.list.d"
+cat > "$work/apt/sources.list" <<'LIST'
+deb http://deb.debian.org/debian bullseye main
+deb http://deb.debian.org/debian bullseye-backports main
+deb-src [signed-by=/usr/share/keyrings/debian.gpg] https://deb.debian.org/debian/ bullseye-backports main
+# deb http://deb.debian.org/debian bullseye-backports main
+deb http://mirror.hetzner.com/debian/packages bullseye-backports main
+deb https://download.docker.com/linux/debian bullseye stable
+LIST
+cp "$work/apt/sources.list" "$work/original.list"
+(
+    ID=debian VERSION_CODENAME=bullseye
+    repair_apt_sources "$work/apt"
+    [[ $(awk '/^# server-setup:/{n++} END{print n+0}' "$work/apt/sources.list") == 2 ]]
+    [[ $(cat "$work/apt/sources.list") == *'deb http://mirror.hetzner.com/debian/packages bullseye-backports main'* ]]
+    [[ $(cat "$work/apt/sources.list") == *'deb https://download.docker.com/linux/debian bullseye stable'* ]]
+    backups=("$work/apt/sources.list".server-setup-backup.*)
+    [[ ${#backups[@]} == 1 ]]
+    cmp "$work/original.list" "${backups[0]}"
+    cp "$work/apt/sources.list" "$work/repaired.list"
+    repair_apt_sources "$work/apt"
+    cmp "$work/repaired.list" "$work/apt/sources.list"
+    backups=("$work/apt/sources.list".server-setup-backup.*)
+    [[ ${#backups[@]} == 1 ]]
+    cp "$work/original.list" "$work/apt/sources.list.d/untouched.list"
+    ID=ubuntu VERSION_CODENAME=noble
+    repair_apt_sources "$work/apt"
+    cmp "$work/original.list" "$work/apt/sources.list.d/untouched.list"
+)
+
+# 模拟依赖安装，不访问真实 APT；未知源失败仍停止，绝不放宽签名检查。
+(
+    repair_apt_sources() { echo repair >> "$work/apt-order"; }
+    dpkg-query() {
+        [[ ${*: -1} == curl ]] || return 1
+        echo 'install ok installed'
+    }
+    apt-get() { echo "$*" >> "$work/apt-order"; }
+    install_packages curl wget
+    [[ $(cat "$work/apt-order") == $'repair\nupdate\ninstall -y --no-install-recommends wget' ]]
+    rm "$work/apt-order"
+    install_packages curl
+    [[ $(cat "$work/apt-order") == repair ]]
+    apt-get() { echo "$*" >> "$work/apt-order"; return 100; }
+    set +e
+    (set -e; install_packages wget) > "$work/apt-error" 2>&1
+    status=$?
+    set -e
+    [[ $status != 0 ]]
+    [[ $(cat "$work/apt-order") == $'repair\nrepair\nupdate' ]]
+)
+
 parse_selection '2'
 [[ ${selected[*]} == '2 4' ]]
 parse_selection '1,2 4,4'

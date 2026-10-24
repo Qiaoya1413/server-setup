@@ -20,9 +20,43 @@ parse_selection() {
     fi
 }
 
+repair_apt_sources() (
+    local apt_dir="${1:-/etc/apt}" work file backup
+    [[ ${ID:-} == debian && ${VERSION_CODENAME:-} == bullseye ]] || return 0
+    work="$(mktemp -d)"
+    trap 'rm -rf -- "$work"' EXIT
+    for file in "$apt_dir/sources.list" "$apt_dir/sources.list.d/"*.list; do
+        [[ -f $file ]] || continue
+        # 只禁用已退役的官方 bullseye-backports，不改仍可用的镜像、主源及安全源。
+        awk '
+            /^[[:space:]]*deb(-src)?[[:space:]]+(\[[^]]*\][[:space:]]+)?https?:\/\/(deb|ftp)\.debian\.org\/debian\/?[[:space:]]+bullseye-backports([[:space:]]|$)/ {
+                print "# server-setup: disabled retired backports: " $0
+                next
+            }
+            { print }
+        ' "$file" > "$work/sources"
+        cmp -s "$file" "$work/sources" && continue
+        backup="$(mktemp --suffix=.save "${file}.server-setup-backup.XXXXXX")"
+        cp -p -- "$file" "$backup"
+        cat "$work/sources" > "$file"
+        echo "已禁用失效的官方 bullseye-backports 条目；备份：$backup"
+    done
+)
+
 install_packages() {
-    apt-get update
-    DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends "$@"
+    local package missing=()
+    repair_apt_sources
+    for package in "$@"; do
+        if [[ $(dpkg-query -W -f='${Status}' -- "$package" 2>/dev/null) != 'install ok installed' ]]; then
+            missing+=("$package")
+        fi
+    done
+    if [[ ${#missing[@]} == 0 ]]; then
+        echo '所需系统依赖已安装，跳过重复安装。'
+        return 0
+    fi
+    apt-get update || fail 'APT 更新失败，已停止安装；请检查上方报错中的软件源，脚本不会绕过签名校验。'
+    DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends "${missing[@]}" || fail '系统依赖安装失败，已停止当前步骤。'
 }
 
 # 每次使用独立目录；下载失败不会执行旧文件或不完整的脚本。
